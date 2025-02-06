@@ -1,10 +1,11 @@
 /* eslint-disable sonarjs/no-identical-functions */
-import './NodeDetails.styles.scss';
+import '../../EntityDetailsUtils/entityDetails.styles.scss';
 
 import { Color, Spacing } from '@signozhq/design-tokens';
 import { Button, Divider, Drawer, Radio, Tooltip, Typography } from 'antd';
 import { RadioChangeEvent } from 'antd/lib';
 import logEvent from 'api/common/logEvent';
+import { K8sNodesData } from 'api/infraMonitoring/getK8sNodesList';
 import { VIEW_TYPES, VIEWS } from 'components/HostMetricsDetail/constants';
 import { QueryParams } from 'constants/query';
 import {
@@ -12,6 +13,9 @@ import {
 	initialQueryState,
 } from 'constants/queryBuilder';
 import ROUTES from 'constants/routes';
+import { filterDuplicateFilters } from 'container/InfraMonitoringK8s/commonUtils';
+import { K8sCategory } from 'container/InfraMonitoringK8s/constants';
+import NodeEvents from 'container/InfraMonitoringK8s/EntityDetailsUtils/EntityEvents';
 import {
 	CustomTimeType,
 	Time,
@@ -42,12 +46,12 @@ import {
 import { GlobalReducer } from 'types/reducer/globalTime';
 import { v4 as uuidv4 } from 'uuid';
 
-import { QUERY_KEYS } from './constants';
-import NodeEvents from './Events';
-import NodeLogs from './Logs';
-import NodeMetrics from './Metrics';
+import NodeLogs from '../../EntityDetailsUtils/EntityLogs';
+import NodeMetrics from '../../EntityDetailsUtils/EntityMetrics';
+import NodeTraces from '../../EntityDetailsUtils/EntityTraces';
+import { QUERY_KEYS } from '../../EntityDetailsUtils/utils';
+import { getNodeMetricsQueryPayload, nodeWidgetInfo } from './constants';
 import { NodeDetailsProps } from './NodeDetails.interfaces';
-import NodeTraces from './Traces';
 
 function NodeDetails({
 	node,
@@ -97,22 +101,9 @@ function NodeDetails({
 					op: '=',
 					value: node?.meta.k8s_node_name || '',
 				},
-				{
-					id: uuidv4(),
-					key: {
-						key: QUERY_KEYS.K8S_CLUSTER_NAME,
-						dataType: DataTypes.String,
-						type: 'resource',
-						isColumn: false,
-						isJSON: false,
-						id: 'k8s_node_name--string--resource--false',
-					},
-					op: '=',
-					value: node?.meta.k8s_cluster_name || '',
-				},
 			],
 		}),
-		[node?.meta.k8s_node_name, node?.meta.k8s_cluster_name],
+		[node?.meta.k8s_node_name],
 	);
 
 	const initialEventsFilters = useMemo(
@@ -150,13 +141,9 @@ function NodeDetails({
 		[node?.meta.k8s_node_name],
 	);
 
-	const [logFilters, setLogFilters] = useState<IBuilderQuery['filters']>(
-		initialFilters,
-	);
-
-	const [tracesFilters, setTracesFilters] = useState<IBuilderQuery['filters']>(
-		initialFilters,
-	);
+	const [logAndTracesFilters, setLogAndTracesFilters] = useState<
+		IBuilderQuery['filters']
+	>(initialFilters);
 
 	const [eventsFilters, setEventsFilters] = useState<IBuilderQuery['filters']>(
 		initialEventsFilters,
@@ -170,8 +157,7 @@ function NodeDetails({
 	}, []);
 
 	useEffect(() => {
-		setLogFilters(initialFilters);
-		setTracesFilters(initialFilters);
+		setLogAndTracesFilters(initialFilters);
 		setEventsFilters(initialEventsFilters);
 	}, [initialFilters, initialEventsFilters]);
 
@@ -190,6 +176,10 @@ function NodeDetails({
 
 	const handleTabChange = (e: RadioChangeEvent): void => {
 		setSelectedView(e.target.value);
+		logEvent('Infra Monitoring: Nodes list details tab changed', {
+			node: node?.nodeUID,
+			view: e.target.value,
+		});
 	};
 
 	const handleTimeChange = useCallback(
@@ -213,6 +203,7 @@ function NodeDetails({
 			logEvent('Infra Monitoring: Nodes list details time updated', {
 				node: node?.nodeUID,
 				interval,
+				view: selectedView,
 			});
 		},
 		// eslint-disable-next-line react-hooks/exhaustive-deps
@@ -221,7 +212,7 @@ function NodeDetails({
 
 	const handleChangeLogFilters = useCallback(
 		(value: IBuilderQuery['filters']) => {
-			setLogFilters((prevFilters) => {
+			setLogAndTracesFilters((prevFilters) => {
 				const primaryFilters = prevFilters.items.filter((item) =>
 					[QUERY_KEYS.K8S_NODE_NAME, QUERY_KEYS.K8S_CLUSTER_NAME].includes(
 						item.key?.key ?? '',
@@ -239,11 +230,13 @@ function NodeDetails({
 
 				return {
 					op: 'AND',
-					items: [
-						...primaryFilters,
-						...newFilters,
-						...(paginationFilter ? [paginationFilter] : []),
-					].filter((item): item is TagFilterItem => item !== undefined),
+					items: filterDuplicateFilters(
+						[
+							...primaryFilters,
+							...newFilters,
+							...(paginationFilter ? [paginationFilter] : []),
+						].filter((item): item is TagFilterItem => item !== undefined),
+					),
 				};
 			});
 		},
@@ -253,7 +246,7 @@ function NodeDetails({
 
 	const handleChangeTracesFilters = useCallback(
 		(value: IBuilderQuery['filters']) => {
-			setTracesFilters((prevFilters) => {
+			setLogAndTracesFilters((prevFilters) => {
 				const primaryFilters = prevFilters.items.filter((item) =>
 					[QUERY_KEYS.K8S_NODE_NAME, QUERY_KEYS.K8S_CLUSTER_NAME].includes(
 						item.key?.key ?? '',
@@ -266,12 +259,14 @@ function NodeDetails({
 
 				return {
 					op: 'AND',
-					items: [
-						...primaryFilters,
-						...value.items.filter(
-							(item) => item.key?.key !== QUERY_KEYS.K8S_NODE_NAME,
-						),
-					].filter((item): item is TagFilterItem => item !== undefined),
+					items: filterDuplicateFilters(
+						[
+							...primaryFilters,
+							...value.items.filter(
+								(item) => item.key?.key !== QUERY_KEYS.K8S_NODE_NAME,
+							),
+						].filter((item): item is TagFilterItem => item !== undefined),
+					),
 				};
 			});
 		},
@@ -327,8 +322,8 @@ function NodeDetails({
 
 		if (selectedView === VIEW_TYPES.LOGS) {
 			const filtersWithoutPagination = {
-				...logFilters,
-				items: logFilters.items.filter((item) => item.key?.key !== 'id'),
+				...logAndTracesFilters,
+				items: logAndTracesFilters.items.filter((item) => item.key?.key !== 'id'),
 			};
 
 			const compositeQuery = {
@@ -362,7 +357,7 @@ function NodeDetails({
 						{
 							...initialQueryBuilderFormValuesMap.traces,
 							aggregateOperator: TracesAggregatorOperator.NOOP,
-							filters: tracesFilters,
+							filters: logAndTracesFilters,
 						},
 					],
 				},
@@ -410,35 +405,35 @@ function NodeDetails({
 				overscrollBehavior: 'contain',
 				background: isDarkMode ? Color.BG_INK_400 : Color.BG_VANILLA_100,
 			}}
-			className="node-detail-drawer"
+			className="entity-detail-drawer"
 			destroyOnClose
 			closeIcon={<X size={16} style={{ marginTop: Spacing.MARGIN_1 }} />}
 		>
 			{node && (
 				<>
-					<div className="node-detail-drawer__node">
-						<div className="node-details-grid">
+					<div className="entity-detail-drawer__entity">
+						<div className="entity-details-grid">
 							<div className="labels-row">
 								<Typography.Text
 									type="secondary"
-									className="node-details-metadata-label"
+									className="entity-details-metadata-label"
 								>
 									Node Name
 								</Typography.Text>
 								<Typography.Text
 									type="secondary"
-									className="node-details-metadata-label"
+									className="entity-details-metadata-label"
 								>
 									Cluster Name
 								</Typography.Text>
 							</div>
 							<div className="values-row">
-								<Typography.Text className="node-details-metadata-value">
+								<Typography.Text className="entity-details-metadata-value">
 									<Tooltip title={node.meta.k8s_node_name}>
 										{node.meta.k8s_node_name}
 									</Tooltip>
 								</Typography.Text>
-								<Typography.Text className="node-details-metadata-value">
+								<Typography.Text className="entity-details-metadata-value">
 									<Tooltip title="Cluster name">{node.meta.k8s_cluster_name}</Tooltip>
 								</Typography.Text>
 							</div>
@@ -508,12 +503,16 @@ function NodeDetails({
 						)}
 					</div>
 					{selectedView === VIEW_TYPES.METRICS && (
-						<NodeMetrics
+						<NodeMetrics<K8sNodesData>
 							timeRange={modalTimeRange}
 							isModalTimeSelection={isModalTimeSelection}
 							handleTimeChange={handleTimeChange}
 							selectedInterval={selectedInterval}
-							node={node}
+							entity={node}
+							entityWidgetInfo={nodeWidgetInfo}
+							getEntityQueryPayload={getNodeMetricsQueryPayload}
+							category={K8sCategory.NODES}
+							queryKey="nodeMetrics"
 						/>
 					)}
 					{selectedView === VIEW_TYPES.LOGS && (
@@ -522,8 +521,11 @@ function NodeDetails({
 							isModalTimeSelection={isModalTimeSelection}
 							handleTimeChange={handleTimeChange}
 							handleChangeLogFilters={handleChangeLogFilters}
-							logFilters={logFilters}
+							logFilters={logAndTracesFilters}
 							selectedInterval={selectedInterval}
+							queryKeyFilters={[QUERY_KEYS.K8S_NODE_NAME, QUERY_KEYS.K8S_CLUSTER_NAME]}
+							queryKey="nodeLogs"
+							category={K8sCategory.NODES}
 						/>
 					)}
 					{selectedView === VIEW_TYPES.TRACES && (
@@ -532,8 +534,10 @@ function NodeDetails({
 							isModalTimeSelection={isModalTimeSelection}
 							handleTimeChange={handleTimeChange}
 							handleChangeTracesFilters={handleChangeTracesFilters}
-							tracesFilters={tracesFilters}
+							tracesFilters={logAndTracesFilters}
 							selectedInterval={selectedInterval}
+							queryKeyFilters={[QUERY_KEYS.K8S_NODE_NAME, QUERY_KEYS.K8S_CLUSTER_NAME]}
+							queryKey="nodeTraces"
 						/>
 					)}
 					{selectedView === VIEW_TYPES.EVENTS && (
@@ -544,6 +548,8 @@ function NodeDetails({
 							isModalTimeSelection={isModalTimeSelection}
 							handleTimeChange={handleTimeChange}
 							selectedInterval={selectedInterval}
+							category={K8sCategory.NODES}
+							queryKey="nodeEvents"
 						/>
 					)}
 				</>

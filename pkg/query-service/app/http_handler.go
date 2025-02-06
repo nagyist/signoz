@@ -56,7 +56,6 @@ import (
 	"go.signoz.io/signoz/pkg/query-service/app/logparsingpipeline"
 	"go.signoz.io/signoz/pkg/query-service/dao"
 	am "go.signoz.io/signoz/pkg/query-service/integrations/alertManager"
-	"go.signoz.io/signoz/pkg/query-service/integrations/signozio"
 	"go.signoz.io/signoz/pkg/query-service/interfaces"
 	"go.signoz.io/signoz/pkg/query-service/model"
 	"go.signoz.io/signoz/pkg/query-service/rules"
@@ -96,10 +95,6 @@ type APIHandler struct {
 	// should be fast but we can still avoid the query if we have the data in memory
 	temporalityMap map[string]map[v3.Temporality]bool
 	temporalityMux sync.Mutex
-
-	maxIdleConns int
-	maxOpenConns int
-	dialTimeout  time.Duration
 
 	IntegrationsController *integrations.Controller
 
@@ -141,10 +136,6 @@ type APIHandlerOpts struct {
 	SkipConfig *model.SkipConfig
 
 	PreferSpanMetrics bool
-
-	MaxIdleConns int
-	MaxOpenConns int
-	DialTimeout  time.Duration
 
 	// dao layer to perform crud on app objects like dashboard, alerts etc
 	AppDao dao.ModelDao
@@ -225,9 +216,6 @@ func NewAPIHandler(opts APIHandlerOpts) (*APIHandler, error) {
 		skipConfig:                    opts.SkipConfig,
 		preferSpanMetrics:             opts.PreferSpanMetrics,
 		temporalityMap:                make(map[string]map[v3.Temporality]bool),
-		maxIdleConns:                  opts.MaxIdleConns,
-		maxOpenConns:                  opts.MaxOpenConns,
-		dialTimeout:                   opts.DialTimeout,
 		alertManager:                  alertManager,
 		ruleManager:                   opts.RuleManager,
 		featureFlags:                  opts.FeatureFlags,
@@ -392,6 +380,7 @@ func (aH *APIHandler) RegisterQueryRangeV3Routes(router *mux.Router, am *AuthMid
 		withCacheControl(AutoCompleteCacheControlAge, aH.autoCompleteAttributeKeys))).Methods(http.MethodGet)
 	subRouter.HandleFunc("/autocomplete/attribute_values", am.ViewAccess(
 		withCacheControl(AutoCompleteCacheControlAge, aH.autoCompleteAttributeValues))).Methods(http.MethodGet)
+	subRouter.HandleFunc("/autocomplete/attribute_values", am.ViewAccess(aH.autoCompleteAttributeValuesPost)).Methods(http.MethodPost)
 	subRouter.HandleFunc("/query_range", am.ViewAccess(aH.QueryRangeV3)).Methods(http.MethodPost)
 	subRouter.HandleFunc("/query_range/format", am.ViewAccess(aH.QueryRangeV3Format)).Methods(http.MethodPost)
 
@@ -459,6 +448,9 @@ func (aH *APIHandler) RegisterInfraMetricsRoutes(router *mux.Router, am *AuthMid
 	jobsSubRouter.HandleFunc("/attribute_keys", am.ViewAccess(aH.getJobAttributeKeys)).Methods(http.MethodGet)
 	jobsSubRouter.HandleFunc("/attribute_values", am.ViewAccess(aH.getJobAttributeValues)).Methods(http.MethodGet)
 	jobsSubRouter.HandleFunc("/list", am.ViewAccess(aH.getJobList)).Methods(http.MethodPost)
+
+	infraOnboardingSubRouter := router.PathPrefix("/api/v1/infra_onboarding").Subrouter()
+	infraOnboardingSubRouter.HandleFunc("/k8s/status", am.ViewAccess(aH.getK8sInfraOnboardingStatus)).Methods(http.MethodGet)
 }
 
 func (aH *APIHandler) RegisterWebSocketPaths(router *mux.Router, am *AuthMiddleware) {
@@ -546,10 +538,11 @@ func (aH *APIHandler) RegisterRoutes(router *mux.Router, am *AuthMiddleware) {
 
 	router.HandleFunc("/api/v2/traces/fields", am.ViewAccess(aH.traceFields)).Methods(http.MethodGet)
 	router.HandleFunc("/api/v2/traces/fields", am.EditAccess(aH.updateTraceField)).Methods(http.MethodPost)
+	router.HandleFunc("/api/v2/traces/flamegraph/{traceId}", am.ViewAccess(aH.GetFlamegraphSpansForTrace)).Methods(http.MethodPost)
+	router.HandleFunc("/api/v2/traces/waterfall/{traceId}", am.ViewAccess(aH.GetWaterfallSpansForTraceWithMetadata)).Methods(http.MethodPost)
 
 	router.HandleFunc("/api/v1/version", am.OpenAccess(aH.getVersion)).Methods(http.MethodGet)
 	router.HandleFunc("/api/v1/featureFlags", am.OpenAccess(aH.getFeatureFlags)).Methods(http.MethodGet)
-	router.HandleFunc("/api/v1/configs", am.OpenAccess(aH.getConfigs)).Methods(http.MethodGet)
 	router.HandleFunc("/api/v1/health", am.OpenAccess(aH.getHealth)).Methods(http.MethodGet)
 
 	router.HandleFunc("/api/v1/listErrors", am.ViewAccess(aH.listErrors)).Methods(http.MethodPost)
@@ -1777,6 +1770,52 @@ func (aH *APIHandler) SearchTraces(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func (aH *APIHandler) GetWaterfallSpansForTraceWithMetadata(w http.ResponseWriter, r *http.Request) {
+	traceID := mux.Vars(r)["traceId"]
+	if traceID == "" {
+		RespondError(w, model.BadRequest(errors.New("traceID is required")), nil)
+		return
+	}
+
+	req := new(model.GetWaterfallSpansForTraceWithMetadataParams)
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		RespondError(w, model.BadRequest(err), nil)
+		return
+	}
+
+	result, apiErr := aH.reader.GetWaterfallSpansForTraceWithMetadata(r.Context(), traceID, req)
+	if apiErr != nil {
+		RespondError(w, apiErr, nil)
+		return
+	}
+
+	aH.WriteJSON(w, r, result)
+}
+
+func (aH *APIHandler) GetFlamegraphSpansForTrace(w http.ResponseWriter, r *http.Request) {
+	traceID := mux.Vars(r)["traceId"]
+	if traceID == "" {
+		RespondError(w, model.BadRequest(errors.New("traceID is required")), nil)
+		return
+	}
+
+	req := new(model.GetFlamegraphSpansForTraceParams)
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		RespondError(w, model.BadRequest(err), nil)
+		return
+	}
+
+	result, apiErr := aH.reader.GetFlamegraphSpansForTrace(r.Context(), traceID, req)
+	if apiErr != nil {
+		RespondError(w, apiErr, nil)
+		return
+	}
+
+	aH.WriteJSON(w, r, result)
+}
+
 func (aH *APIHandler) listErrors(w http.ResponseWriter, r *http.Request) {
 
 	query, err := parseListErrorsRequest(r)
@@ -1930,16 +1969,6 @@ func (aH *APIHandler) FF() interfaces.FeatureLookup {
 func (aH *APIHandler) CheckFeature(f string) bool {
 	err := aH.FF().CheckFeature(f)
 	return err == nil
-}
-
-func (aH *APIHandler) getConfigs(w http.ResponseWriter, r *http.Request) {
-
-	configs, err := signozio.FetchDynamicConfigs()
-	if err != nil {
-		aH.HandleError(w, err, http.StatusInternalServerError)
-		return
-	}
-	aH.Respond(w, configs)
 }
 
 // getHealth is used to check the health of the service.
@@ -3710,7 +3739,7 @@ func (aH *APIHandler) calculateConnectionStatus(
 		}
 
 		statusForLastReceivedMetric, apiErr := aH.reader.GetLatestReceivedMetric(
-			ctx, connectionTests.Metrics,
+			ctx, connectionTests.Metrics, nil,
 		)
 
 		resultLock.Lock()
@@ -3899,7 +3928,19 @@ func (aH *APIHandler) RegisterCloudIntegrationsRoutes(router *mux.Router, am *Au
 	).Methods(http.MethodPost)
 
 	subRouter.HandleFunc(
-		"/{cloudProvider}/agent-check-in", am.EditAccess(aH.CloudIntegrationsAgentCheckIn),
+		"/{cloudProvider}/agent-check-in", am.ViewAccess(aH.CloudIntegrationsAgentCheckIn),
+	).Methods(http.MethodPost)
+
+	subRouter.HandleFunc(
+		"/{cloudProvider}/services", am.ViewAccess(aH.CloudIntegrationsListServices),
+	).Methods(http.MethodGet)
+
+	subRouter.HandleFunc(
+		"/{cloudProvider}/services/{serviceId}", am.ViewAccess(aH.CloudIntegrationsGetServiceDetails),
+	).Methods(http.MethodGet)
+
+	subRouter.HandleFunc(
+		"/{cloudProvider}/services/{serviceId}/config", am.EditAccess(aH.CloudIntegrationsUpdateServiceConfig),
 	).Methods(http.MethodPost)
 
 }
@@ -4015,6 +4056,292 @@ func (aH *APIHandler) CloudIntegrationsDisconnectAccount(
 
 	result, apiErr := aH.CloudIntegrationsController.DisconnectAccount(
 		r.Context(), cloudProvider, accountId,
+	)
+
+	if apiErr != nil {
+		RespondError(w, apiErr, nil)
+		return
+	}
+
+	aH.Respond(w, result)
+}
+
+func (aH *APIHandler) CloudIntegrationsListServices(
+	w http.ResponseWriter, r *http.Request,
+) {
+	cloudProvider := mux.Vars(r)["cloudProvider"]
+
+	var cloudAccountId *string
+
+	cloudAccountIdQP := r.URL.Query().Get("cloud_account_id")
+	if len(cloudAccountIdQP) > 0 {
+		cloudAccountId = &cloudAccountIdQP
+	}
+
+	resp, apiErr := aH.CloudIntegrationsController.ListServices(
+		r.Context(), cloudProvider, cloudAccountId,
+	)
+
+	if apiErr != nil {
+		RespondError(w, apiErr, nil)
+		return
+	}
+	aH.Respond(w, resp)
+}
+
+func (aH *APIHandler) CloudIntegrationsGetServiceDetails(
+	w http.ResponseWriter, r *http.Request,
+) {
+	cloudProvider := mux.Vars(r)["cloudProvider"]
+	serviceId := mux.Vars(r)["serviceId"]
+
+	var cloudAccountId *string
+
+	cloudAccountIdQP := r.URL.Query().Get("cloud_account_id")
+	if len(cloudAccountIdQP) > 0 {
+		cloudAccountId = &cloudAccountIdQP
+	}
+
+	resp, apiErr := aH.CloudIntegrationsController.GetServiceDetails(
+		r.Context(), cloudProvider, serviceId, cloudAccountId,
+	)
+	if apiErr != nil {
+		RespondError(w, apiErr, nil)
+		return
+	}
+
+	// Add connection status for the 2 signals.
+	if cloudAccountId != nil {
+		connStatus, apiErr := aH.calculateCloudIntegrationServiceConnectionStatus(
+			r.Context(), cloudProvider, *cloudAccountId, resp,
+		)
+		if apiErr != nil {
+			RespondError(w, apiErr, nil)
+			return
+		}
+		resp.ConnectionStatus = connStatus
+	}
+
+	aH.Respond(w, resp)
+}
+
+func (aH *APIHandler) calculateCloudIntegrationServiceConnectionStatus(
+	ctx context.Context,
+	cloudProvider string,
+	cloudAccountId string,
+	svcDetails *cloudintegrations.CloudServiceDetails,
+) (*cloudintegrations.CloudServiceConnectionStatus, *model.ApiError) {
+	if cloudProvider != "aws" {
+		// TODO(Raj): Make connection check generic for all providers in a follow up change
+		return nil, model.BadRequest(
+			fmt.Errorf("unsupported cloud provider: %s", cloudProvider),
+		)
+	}
+
+	telemetryCollectionStrategy := svcDetails.TelemetryCollectionStrategy
+	if telemetryCollectionStrategy == nil {
+		return nil, model.InternalError(fmt.Errorf(
+			"service doesn't have telemetry collection strategy: %s", svcDetails.Id,
+		))
+	}
+
+	result := &cloudintegrations.CloudServiceConnectionStatus{}
+	errors := []*model.ApiError{}
+	var resultLock sync.Mutex
+
+	var wg sync.WaitGroup
+
+	// Calculate metrics connection status
+	if telemetryCollectionStrategy.AWSMetrics != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			metricsConnStatus, apiErr := aH.calculateAWSIntegrationSvcMetricsConnectionStatus(
+				ctx, cloudAccountId, telemetryCollectionStrategy.AWSMetrics, svcDetails.DataCollected.Metrics,
+			)
+
+			resultLock.Lock()
+			defer resultLock.Unlock()
+
+			if apiErr != nil {
+				errors = append(errors, apiErr)
+			} else {
+				result.Metrics = metricsConnStatus
+			}
+		}()
+	}
+
+	// Calculate logs connection status
+	if telemetryCollectionStrategy.AWSLogs != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			logsConnStatus, apiErr := aH.calculateAWSIntegrationSvcLogsConnectionStatus(
+				ctx, cloudAccountId, telemetryCollectionStrategy.AWSLogs,
+			)
+
+			resultLock.Lock()
+			defer resultLock.Unlock()
+
+			if apiErr != nil {
+				errors = append(errors, apiErr)
+			} else {
+				result.Logs = logsConnStatus
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if len(errors) > 0 {
+		return nil, errors[0]
+	}
+
+	return result, nil
+
+}
+func (aH *APIHandler) calculateAWSIntegrationSvcMetricsConnectionStatus(
+	ctx context.Context,
+	cloudAccountId string,
+	strategy *cloudintegrations.AWSMetricsCollectionStrategy,
+	metricsCollectedBySvc []cloudintegrations.CollectedMetric,
+) (*cloudintegrations.SignalConnectionStatus, *model.ApiError) {
+	if strategy == nil || len(strategy.CloudwatchMetricsStreamFilters) < 1 {
+		return nil, nil
+	}
+
+	metricsNamespace := strategy.CloudwatchMetricsStreamFilters[0].Namespace
+	metricsNamespaceParts := strings.Split(metricsNamespace, "/")
+	if len(metricsNamespaceParts) < 2 {
+		return nil, model.InternalError(fmt.Errorf(
+			"unexpected metric namespace: %s", metricsNamespace,
+		))
+	}
+
+	expectedLabelValues := map[string]string{
+		"cloud_provider":    "aws",
+		"cloud_account_id":  cloudAccountId,
+		"service_namespace": metricsNamespaceParts[0],
+		"service_name":      metricsNamespaceParts[1],
+	}
+
+	metricNamesCollectedBySvc := []string{}
+	for _, cm := range metricsCollectedBySvc {
+		metricNamesCollectedBySvc = append(metricNamesCollectedBySvc, cm.Name)
+	}
+
+	statusForLastReceivedMetric, apiErr := aH.reader.GetLatestReceivedMetric(
+		ctx, metricNamesCollectedBySvc, expectedLabelValues,
+	)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	if statusForLastReceivedMetric != nil {
+		return &cloudintegrations.SignalConnectionStatus{
+			LastReceivedTsMillis: statusForLastReceivedMetric.LastReceivedTsMillis,
+			LastReceivedFrom:     "signoz-aws-integration",
+		}, nil
+	}
+
+	return nil, nil
+}
+
+func (aH *APIHandler) calculateAWSIntegrationSvcLogsConnectionStatus(
+	ctx context.Context,
+	cloudAccountId string,
+	strategy *cloudintegrations.AWSLogsCollectionStrategy,
+) (*cloudintegrations.SignalConnectionStatus, *model.ApiError) {
+	if strategy == nil || len(strategy.CloudwatchLogsSubscriptions) < 1 {
+		return nil, nil
+	}
+
+	logGroupNamePrefix := strategy.CloudwatchLogsSubscriptions[0].LogGroupNamePrefix
+	if len(logGroupNamePrefix) < 1 {
+		return nil, nil
+	}
+
+	logsConnTestFilter := &v3.FilterSet{
+		Operator: "AND",
+		Items: []v3.FilterItem{
+			{
+				Key: v3.AttributeKey{
+					Key:      "cloud.account.id",
+					DataType: v3.AttributeKeyDataTypeString,
+					Type:     v3.AttributeKeyTypeResource,
+				},
+				Operator: "=",
+				Value:    cloudAccountId,
+			},
+			{
+				Key: v3.AttributeKey{
+					Key:      "aws.cloudwatch.log_group_name",
+					DataType: v3.AttributeKeyDataTypeString,
+					Type:     v3.AttributeKeyTypeResource,
+				},
+				Operator: "like",
+				Value:    logGroupNamePrefix + "%",
+			},
+		},
+	}
+
+	// TODO(Raj): Receive this as a param from UI in the future.
+	lookbackSeconds := int64(30 * 60)
+
+	qrParams := &v3.QueryRangeParamsV3{
+		Start: time.Now().UnixMilli() - (lookbackSeconds * 1000),
+		End:   time.Now().UnixMilli(),
+		CompositeQuery: &v3.CompositeQuery{
+			PanelType: v3.PanelTypeList,
+			QueryType: v3.QueryTypeBuilder,
+			BuilderQueries: map[string]*v3.BuilderQuery{
+				"A": {
+					PageSize:          1,
+					Filters:           logsConnTestFilter,
+					QueryName:         "A",
+					DataSource:        v3.DataSourceLogs,
+					Expression:        "A",
+					AggregateOperator: v3.AggregateOperatorNoOp,
+				},
+			},
+		},
+	}
+	queryRes, _, err := aH.querier.QueryRange(
+		ctx, qrParams,
+	)
+	if err != nil {
+		return nil, model.InternalError(fmt.Errorf(
+			"could not query for integration connection status: %w", err,
+		))
+	}
+	if len(queryRes) > 0 && queryRes[0].List != nil && len(queryRes[0].List) > 0 {
+		lastLog := queryRes[0].List[0]
+
+		return &cloudintegrations.SignalConnectionStatus{
+			LastReceivedTsMillis: lastLog.Timestamp.UnixMilli(),
+			LastReceivedFrom:     "signoz-aws-integration",
+		}, nil
+	}
+
+	return nil, nil
+}
+
+func (aH *APIHandler) CloudIntegrationsUpdateServiceConfig(
+	w http.ResponseWriter, r *http.Request,
+) {
+	cloudProvider := mux.Vars(r)["cloudProvider"]
+	serviceId := mux.Vars(r)["serviceId"]
+
+	req := cloudintegrations.UpdateServiceConfigRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		RespondError(w, model.BadRequest(err), nil)
+		return
+	}
+
+	result, apiErr := aH.CloudIntegrationsController.UpdateServiceConfig(
+		r.Context(), cloudProvider, serviceId, req,
 	)
 
 	if apiErr != nil {
@@ -4463,6 +4790,35 @@ func (aH *APIHandler) autoCompleteAttributeKeys(w http.ResponseWriter, r *http.R
 func (aH *APIHandler) autoCompleteAttributeValues(w http.ResponseWriter, r *http.Request) {
 	var response *v3.FilterAttributeValueResponse
 	req, err := parseFilterAttributeValueRequest(r)
+
+	if err != nil {
+		RespondError(w, &model.ApiError{Typ: model.ErrorBadData, Err: err}, nil)
+		return
+	}
+
+	switch req.DataSource {
+	case v3.DataSourceMetrics:
+		response, err = aH.reader.GetMetricAttributeValues(r.Context(), req)
+	case v3.DataSourceLogs:
+		response, err = aH.reader.GetLogAttributeValues(r.Context(), req)
+	case v3.DataSourceTraces:
+		response, err = aH.reader.GetTraceAttributeValues(r.Context(), req)
+	default:
+		RespondError(w, &model.ApiError{Typ: model.ErrorBadData, Err: fmt.Errorf("invalid data source")}, nil)
+		return
+	}
+
+	if err != nil {
+		RespondError(w, &model.ApiError{Typ: model.ErrorBadData, Err: err}, nil)
+		return
+	}
+
+	aH.Respond(w, response)
+}
+
+func (aH *APIHandler) autoCompleteAttributeValuesPost(w http.ResponseWriter, r *http.Request) {
+	var response *v3.FilterAttributeValueResponse
+	req, err := parseFilterAttributeValueRequestBody(r)
 
 	if err != nil {
 		RespondError(w, &model.ApiError{Typ: model.ErrorBadData, Err: err}, nil)

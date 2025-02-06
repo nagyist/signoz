@@ -8,6 +8,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	"go.signoz.io/signoz/pkg/query-service/model"
+	"golang.org/x/exp/maps"
 )
 
 var SupportedCloudProviders = []string{
@@ -22,19 +23,26 @@ func validateCloudProviderName(name string) *model.ApiError {
 }
 
 type Controller struct {
-	repo cloudProviderAccountsRepository
+	accountsRepo      cloudProviderAccountsRepository
+	serviceConfigRepo serviceConfigRepository
 }
 
 func NewController(db *sqlx.DB) (
 	*Controller, error,
 ) {
-	repo, err := newCloudProviderAccountsRepository(db)
+	accountsRepo, err := newCloudProviderAccountsRepository(db)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create cloud provider accounts repo: %w", err)
 	}
 
+	serviceConfigRepo, err := newServiceConfigRepository(db)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't create cloud provider service config repo: %w", err)
+	}
+
 	return &Controller{
-		repo: repo,
+		accountsRepo:      accountsRepo,
+		serviceConfigRepo: serviceConfigRepo,
 	}, nil
 }
 
@@ -58,7 +66,7 @@ func (c *Controller) ListConnectedAccounts(
 		return nil, apiErr
 	}
 
-	accountRecords, apiErr := c.repo.listConnected(ctx, cloudProvider)
+	accountRecords, apiErr := c.accountsRepo.listConnected(ctx, cloudProvider)
 	if apiErr != nil {
 		return nil, model.WrapApiError(apiErr, "couldn't list cloud accounts")
 	}
@@ -85,6 +93,11 @@ type GenerateConnectionUrlRequest struct {
 type SigNozAgentConfig struct {
 	// The region in which SigNoz agent should be installed.
 	Region string `json:"region"`
+
+	IngestionUrl string `json:"ingestion_url"`
+	IngestionKey string `json:"ingestion_key"`
+	SigNozAPIUrl string `json:"signoz_api_url"`
+	SigNozAPIKey string `json:"signoz_api_key"`
 }
 
 type GenerateConnectionUrlResponse struct {
@@ -100,7 +113,7 @@ func (c *Controller) GenerateConnectionUrl(
 		return nil, model.BadRequest(fmt.Errorf("unsupported cloud provider: %s", cloudProvider))
 	}
 
-	account, apiErr := c.repo.upsert(
+	account, apiErr := c.accountsRepo.upsert(
 		ctx, cloudProvider, req.AccountId, &req.AccountConfig, nil, nil, nil,
 	)
 	if apiErr != nil {
@@ -120,8 +133,9 @@ func (c *Controller) GenerateConnectionUrl(
 }
 
 type AccountStatusResponse struct {
-	Id     string        `json:"id"`
-	Status AccountStatus `json:"status"`
+	Id             string        `json:"id"`
+	CloudAccountId *string       `json:"cloud_account_id,omitempty"`
+	Status         AccountStatus `json:"status"`
 }
 
 func (c *Controller) GetAccountStatus(
@@ -133,14 +147,15 @@ func (c *Controller) GetAccountStatus(
 		return nil, apiErr
 	}
 
-	account, apiErr := c.repo.get(ctx, cloudProvider, accountId)
+	account, apiErr := c.accountsRepo.get(ctx, cloudProvider, accountId)
 	if apiErr != nil {
 		return nil, apiErr
 	}
 
 	resp := AccountStatusResponse{
-		Id:     account.Id,
-		Status: account.status(),
+		Id:             account.Id,
+		CloudAccountId: account.CloudAccountId,
+		Status:         account.status(),
 	}
 
 	return &resp, nil
@@ -154,7 +169,17 @@ type AgentCheckInRequest struct {
 }
 
 type AgentCheckInResponse struct {
-	Account AccountRecord `json:"account"`
+	AccountId      string     `json:"account_id"`
+	CloudAccountId string     `json:"cloud_account_id"`
+	RemovedAt      *time.Time `json:"removed_at"`
+
+	IntegrationConfig IntegrationConfigForAgent `json:"integration_config"`
+}
+
+type IntegrationConfigForAgent struct {
+	EnabledRegions []string `json:"enabled_regions"`
+
+	TelemetryCollectionStrategy *CloudTelemetryCollectionStrategy `json:"telemetry,omitempty"`
 }
 
 func (c *Controller) CheckInAsAgent(
@@ -164,7 +189,7 @@ func (c *Controller) CheckInAsAgent(
 		return nil, apiErr
 	}
 
-	existingAccount, apiErr := c.repo.get(ctx, cloudProvider, req.AccountId)
+	existingAccount, apiErr := c.accountsRepo.get(ctx, cloudProvider, req.AccountId)
 	if existingAccount != nil && existingAccount.CloudAccountId != nil && *existingAccount.CloudAccountId != req.CloudAccountId {
 		return nil, model.BadRequest(fmt.Errorf(
 			"can't check in with new %s account id %s for account %s with existing %s id %s",
@@ -172,7 +197,7 @@ func (c *Controller) CheckInAsAgent(
 		))
 	}
 
-	existingAccount, apiErr = c.repo.getConnectedCloudAccount(ctx, cloudProvider, req.CloudAccountId)
+	existingAccount, apiErr = c.accountsRepo.getConnectedCloudAccount(ctx, cloudProvider, req.CloudAccountId)
 	if existingAccount != nil && existingAccount.Id != req.AccountId {
 		return nil, model.BadRequest(fmt.Errorf(
 			"can't check in to %s account %s with id %s. already connected with id %s",
@@ -185,15 +210,77 @@ func (c *Controller) CheckInAsAgent(
 		Data:            req.Data,
 	}
 
-	account, apiErr := c.repo.upsert(
+	account, apiErr := c.accountsRepo.upsert(
 		ctx, cloudProvider, &req.AccountId, nil, &req.CloudAccountId, &agentReport, nil,
 	)
 	if apiErr != nil {
 		return nil, model.WrapApiError(apiErr, "couldn't upsert cloud account")
 	}
 
+	// prepare and return integration config to be consumed by agent
+	telemetryCollectionStrategy, err := NewCloudTelemetryCollectionStrategy(cloudProvider)
+	if err != nil {
+		return nil, model.InternalError(fmt.Errorf(
+			"couldn't init telemetry collection strategy: %w", err,
+		))
+	}
+
+	agentConfig := IntegrationConfigForAgent{
+		EnabledRegions:              []string{},
+		TelemetryCollectionStrategy: telemetryCollectionStrategy,
+	}
+
+	if account.Config != nil && account.Config.EnabledRegions != nil {
+		agentConfig.EnabledRegions = account.Config.EnabledRegions
+	}
+
+	services, apiErr := listCloudProviderServices(cloudProvider)
+	if apiErr != nil {
+		return nil, model.WrapApiError(apiErr, "couldn't list cloud services")
+	}
+	svcDetailsById := map[string]*CloudServiceDetails{}
+	for _, svcDetails := range services {
+		svcDetailsById[svcDetails.Id] = &svcDetails
+	}
+
+	svcConfigs, apiErr := c.serviceConfigRepo.getAllForAccount(
+		ctx, cloudProvider, *account.CloudAccountId,
+	)
+	if apiErr != nil {
+		return nil, model.WrapApiError(
+			apiErr, "couldn't get service configs for cloud account",
+		)
+	}
+
+	// accumulate config in a fixed order to ensure same config generated across runs
+	configuredSvcIds := maps.Keys(svcConfigs)
+	slices.Sort(configuredSvcIds)
+
+	for _, svcId := range configuredSvcIds {
+		svcDetails := svcDetailsById[svcId]
+		svcConfig := svcConfigs[svcId]
+
+		if svcDetails != nil {
+			metricsEnabled := svcConfig.Metrics != nil && svcConfig.Metrics.Enabled
+			logsEnabled := svcConfig.Logs != nil && svcConfig.Logs.Enabled
+			if logsEnabled || metricsEnabled {
+				err := agentConfig.TelemetryCollectionStrategy.AddServiceStrategy(
+					svcDetails.TelemetryCollectionStrategy, logsEnabled, metricsEnabled,
+				)
+				if err != nil {
+					return nil, model.InternalError(fmt.Errorf(
+						"couldn't add service telemetry collection strategy: %w", err,
+					))
+				}
+			}
+		}
+	}
+
 	return &AgentCheckInResponse{
-		Account: *account,
+		AccountId:         account.Id,
+		CloudAccountId:    *account.CloudAccountId,
+		RemovedAt:         account.RemovedAt,
+		IntegrationConfig: agentConfig,
 	}, nil
 }
 
@@ -211,7 +298,7 @@ func (c *Controller) UpdateAccountConfig(
 		return nil, apiErr
 	}
 
-	accountRecord, apiErr := c.repo.upsert(
+	accountRecord, apiErr := c.accountsRepo.upsert(
 		ctx, cloudProvider, &accountId, &req.Config, nil, nil, nil,
 	)
 	if apiErr != nil {
@@ -230,13 +317,13 @@ func (c *Controller) DisconnectAccount(
 		return nil, apiErr
 	}
 
-	account, apiErr := c.repo.get(ctx, cloudProvider, accountId)
+	account, apiErr := c.accountsRepo.get(ctx, cloudProvider, accountId)
 	if apiErr != nil {
 		return nil, model.WrapApiError(apiErr, "couldn't disconnect account")
 	}
 
 	tsNow := time.Now()
-	account, apiErr = c.repo.upsert(
+	account, apiErr = c.accountsRepo.upsert(
 		ctx, cloudProvider, &accountId, nil, nil, nil, &tsNow,
 	)
 	if apiErr != nil {
@@ -244,4 +331,128 @@ func (c *Controller) DisconnectAccount(
 	}
 
 	return account, nil
+}
+
+type ListServicesResponse struct {
+	Services []CloudServiceSummary `json:"services"`
+}
+
+func (c *Controller) ListServices(
+	ctx context.Context,
+	cloudProvider string,
+	cloudAccountId *string,
+) (*ListServicesResponse, *model.ApiError) {
+
+	if apiErr := validateCloudProviderName(cloudProvider); apiErr != nil {
+		return nil, apiErr
+	}
+
+	services, apiErr := listCloudProviderServices(cloudProvider)
+	if apiErr != nil {
+		return nil, model.WrapApiError(apiErr, "couldn't list cloud services")
+	}
+
+	svcConfigs := map[string]*CloudServiceConfig{}
+	if cloudAccountId != nil {
+		svcConfigs, apiErr = c.serviceConfigRepo.getAllForAccount(
+			ctx, cloudProvider, *cloudAccountId,
+		)
+		if apiErr != nil {
+			return nil, model.WrapApiError(
+				apiErr, "couldn't get service configs for cloud account",
+			)
+		}
+	}
+
+	summaries := []CloudServiceSummary{}
+	for _, s := range services {
+		summary := s.CloudServiceSummary
+		summary.Config = svcConfigs[summary.Id]
+
+		summaries = append(summaries, summary)
+	}
+
+	return &ListServicesResponse{
+		Services: summaries,
+	}, nil
+}
+
+func (c *Controller) GetServiceDetails(
+	ctx context.Context,
+	cloudProvider string,
+	serviceId string,
+	cloudAccountId *string,
+) (*CloudServiceDetails, *model.ApiError) {
+
+	if apiErr := validateCloudProviderName(cloudProvider); apiErr != nil {
+		return nil, apiErr
+	}
+
+	service, apiErr := getCloudProviderService(cloudProvider, serviceId)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	if cloudAccountId != nil {
+		config, apiErr := c.serviceConfigRepo.get(
+			ctx, cloudProvider, *cloudAccountId, serviceId,
+		)
+		if apiErr != nil && apiErr.Type() != model.ErrorNotFound {
+			return nil, model.WrapApiError(apiErr, "couldn't fetch service config")
+		}
+
+		if config != nil {
+			service.Config = config
+		}
+	}
+
+	return service, nil
+}
+
+type UpdateServiceConfigRequest struct {
+	CloudAccountId string             `json:"cloud_account_id"`
+	Config         CloudServiceConfig `json:"config"`
+}
+
+type UpdateServiceConfigResponse struct {
+	Id     string             `json:"id"`
+	Config CloudServiceConfig `json:"config"`
+}
+
+func (c *Controller) UpdateServiceConfig(
+	ctx context.Context,
+	cloudProvider string,
+	serviceId string,
+	req UpdateServiceConfigRequest,
+) (*UpdateServiceConfigResponse, *model.ApiError) {
+
+	if apiErr := validateCloudProviderName(cloudProvider); apiErr != nil {
+		return nil, apiErr
+	}
+
+	// can only update config for a connected cloud account id
+	_, apiErr := c.accountsRepo.getConnectedCloudAccount(
+		ctx, cloudProvider, req.CloudAccountId,
+	)
+	if apiErr != nil {
+		return nil, model.WrapApiError(apiErr, "couldn't find connected cloud account")
+	}
+
+	// can only update config for a valid service.
+	_, apiErr = getCloudProviderService(cloudProvider, serviceId)
+	if apiErr != nil {
+		return nil, model.WrapApiError(apiErr, "unsupported service")
+	}
+
+	updatedConfig, apiErr := c.serviceConfigRepo.upsert(
+		ctx, cloudProvider, req.CloudAccountId, serviceId, req.Config,
+	)
+	if apiErr != nil {
+		return nil, model.WrapApiError(apiErr, "couldn't update service config")
+	}
+
+	return &UpdateServiceConfigResponse{
+		Id:     serviceId,
+		Config: *updatedConfig,
+	}, nil
 }
